@@ -2,11 +2,21 @@ package main
 
 import (
 	"bufio"
+	"crypto/md5"
+	"encoding/hex"
 	"flag"
+	"github.com/mgutz/str"
 	"github.com/sirupsen/logrus"
 	"io"
+	"net/url"
 	"os"
+	"strings"
 	"time"
+)
+
+const (
+	START_STR = "127.0.0.1--"
+	END_STR = "/HTTP"
 )
 
 type cmdParams struct {
@@ -19,6 +29,7 @@ type cmdParams struct {
 type urlData struct {
 	data digData
 	uid  string
+
 }
 
 type digData struct {
@@ -101,8 +112,57 @@ func uvCounter(uvChannel chan urlData, storeChannel chan storageBlock) {
 
 }
 
-func logConsumer(logChannel chan string, pvChannel, uvChannel chan urlData) {
+// 日志解析模块：消费chanel中日志
+func logConsumer(logChannel chan string, pvChannel, uvChannel chan urlData) error{
+	// 从logChannel中消费日志
+	for logStr := range logChannel {
+		// 切割日志字符串，拿出需要的数据
+		need := cutLogFetchData(logStr)
 
+		// uid ：模拟一个用户id
+		hasher := md5.New()
+		hasher.Write([]byte(need.refer + need.ua))
+		uid := hex.EncodeToString(hasher.Sum(nil))
+
+		// 使用解析到的数据构建 urlData
+		uData := urlData{need,uid}
+
+		log.Infoln(uData)
+
+		// 放入channel中用于统计
+		pvChannel <- uData
+		uvChannel <- uData
+	}
+	return nil
+}
+
+// 切割日志字符串，拿出需要的数据
+func cutLogFetchData(logStr string) digData {
+	// 去除空格
+	logStr = strings.TrimSpace(logStr)
+	startIndex := str.IndexOf(logStr, START_STR, 0)
+	if startIndex == -1{
+		return digData{}
+	}
+	startIndex += len(START_STR)
+	endIndex := str.IndexOf(logStr, END_STR, startIndex)
+
+	d := str.Substr(logStr, startIndex, endIndex - startIndex)
+
+	urlInfo, err := url.Parse("http://127.0.0.1/?" + d)
+	if err != nil {
+		return digData{}
+	}
+	data := urlInfo.Query()
+	// 返回需要的信息
+	needData := digData{
+		data.Get("time"),
+		data.Get("refer"),
+		data.Get("url"),
+		data.Get("ua"),
+	}
+
+	return needData
 }
 
 // 统计分析模块：逐行消费日志
