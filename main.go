@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"github.com/sirupsen/logrus"
+	"io"
 	"os"
 	"time"
 )
@@ -103,6 +105,30 @@ func logConsumer(logChannel chan string, pvChannel, uvChannel chan urlData) {
 
 }
 
+// 统计分析模块：逐行消费日志
 func readFileByLine(params cmdParams, logChannel chan string) {
+	file, err := os.Open(params.logPath)
+	if err != nil {
+		log.Warningf("[readFileByLine] can't open file: %v", err)
+	}
+	defer file.Close()
 
+	count := 0
+	bufReader := bufio.NewReader(file)
+	for  {
+		line, err := bufReader.ReadString('\n')
+		logChannel <- line
+		count++
+		if count % (2 * params.routineNum) == 0{
+			log.Infof("[readFileByLine] read %d line", count)
+		}
+		if err != nil {
+			if err == io.EOF{
+				time.Sleep(3 * time.Second)
+				log.Infof("[readFileByLine] wait, read %d line", count)
+			}else {
+				log.Warningf("[readFileByLine] read log error: %s", err)
+			}
+		}
+	}
 }
