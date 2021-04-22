@@ -72,13 +72,13 @@ func randInt(min, max int) int {
 // 生成日志
 func makeLog(current, refer, ua string) string {
 	u := url.Values{}
-	u.Set("time", "1")
+	u.Set("time", "2021-04-22")
 	u.Set("url", current)
 	u.Set("refer", refer)
 	u.Set("ua", ua)
 
 	paramStr := u.Encode()
-	logTemplate := "127.0.0.1--{$params}--{$ua}"
+	logTemplate := "127.0.0.1--{$params} {$ua}/HTTP1.1"
 	log := strings.Replace(logTemplate, "{$params}", paramStr, -1)
 	log = strings.Replace(log, "{$ua", ua, -1)
 	return log
@@ -87,7 +87,7 @@ func makeLog(current, refer, ua string) string {
 // 生成日志函数
 func main() {
 	// 获取命令行参数
-	total := flag.Int("total", 100, "how many rows by created")
+	total := flag.Int("total", 1000, "how many rows by created")
 	filePath := flag.String("filePath", "F:\\go_project\\src\\analysis\\logs\\dig.log", "file path")
 	flag.Parse()
 
