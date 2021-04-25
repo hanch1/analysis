@@ -5,7 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"flag"
-	"github.com/mediocregopher/radix.v2/pool"
+	"github.com/go-redis/redis"
 	"github.com/mgutz/str"
 	"github.com/sirupsen/logrus"
 	"io"
@@ -95,7 +95,7 @@ func main() {
 	var uvChannel = make(chan urlData, params.routineNum)
 	var storeChannel = make(chan storageBlock, params.routineNum)
 
-	/*// go-redis  redis连接池
+	// go-redis  redis连接池
 	redisPool := redis.NewClient(&redis.Options{
 		//连接信息
 		Network:  "tcp",            //网络类型，tcp or unix，默认tcp
@@ -133,22 +133,23 @@ func main() {
 
 		}()
 		defer redisPool.Close()
-	}*/
-
-	// Redis Pool
-	redisPool, err := pool.New("tcp", "localhost:6379", 2*params.routineNum)
-	if err != nil {
-		log.Fatalln("Redis pool created failed.")
-		panic(err)
-	} else {
-		go func() {
-			for {
-				redisPool.Cmd("PING")
-				time.Sleep(3 * time.Second)
-			}
-		}()
 	}
 
+	/*	// Radix.v2
+		redisPool, err := pool.New("tcp", "localhost:6379", 2 * params.routineNum)
+		if err != nil {
+			log.Fatalln("Redis pool created failed.")
+			panic(err)
+		} else {
+			go func() {
+				for {
+					// 防止timeout
+					redisPool.Cmd("PING")
+					time.Sleep(3 * time.Second)
+				}
+			}()
+		}
+	*/
 	// （日志消费者）开启goroutine 消费日志
 	go readFileByLine(params, logChannel)
 
@@ -232,27 +233,28 @@ func pvCounter(pvChannel chan urlData, storeChannel chan storageBlock) {
 }
 
 // UV Channel (需要去重)
-func uvCounter(uvChannel chan urlData, storeChannel chan storageBlock, redisPool *pool.Pool) {
+func uvCounter(uvChannel chan urlData, storeChannel chan storageBlock, redisPool *redis.Client) {
 	for udata := range uvChannel {
 		// 去重  HyperLogLog  redis
 		hyperLogLogkey := "uv_hpll_" + getTime("day")
 
-		/*// go-redis
+		// go-redis
 		res := redisPool.PFAdd(hyperLogLogkey, udata.uid)
 		//  一天内用户不能重复
 		redisPool.Expire(hyperLogLogkey, 24*time.Hour)
 		if res.Val() == 1 {
 			// 说明 hyperloglog中不存在
 			continue
-		}*/
+		}
 
-		ret, err := redisPool.Cmd("PFADD", hyperLogLogkey, udata.uid, "EX", 86400).Int()
-		if err != nil {
-			log.Warningln("[UvCounter] check redis hyperloglog failed, ", err)
-		}
-		if ret != 1 {
-			continue
-		}
+		/*		// Radix.v2
+				ret, err := redisPool.Cmd("PFADD", hyperLogLogkey, udata.uid, "EX", 86400).Int()
+				if err != nil {
+					log.Warningln("[UvCounter] check redis hyperloglog failed, ", err)
+				}
+				if ret != 1 {
+					continue
+				}*/
 
 		sItem := storageBlock{
 			counterType:  "uv",
@@ -263,7 +265,7 @@ func uvCounter(uvChannel chan urlData, storeChannel chan storageBlock, redisPool
 	}
 }
 
-func dataStorage(storeChannel chan storageBlock, redisPool *pool.Pool) {
+func dataStorage(storeChannel chan storageBlock, redisPool *redis.Client) {
 	for block := range storeChannel {
 		// 表示counter类型（PV，UV）
 		prefix := block.counterType + "_"
@@ -286,11 +288,19 @@ func dataStorage(storeChannel chan storageBlock, redisPool *pool.Pool) {
 		rowId := block.un.unRid
 
 		for _, key := range setKeys {
-			ret, err := redisPool.Cmd(block.storageModel, 1, rowId).Int()
-			if ret <= 0 || err != nil {
+			ret := redisPool.ZIncrBy(key, 1, strconv.Itoa(rowId))
+			if ret.Val() <= 0 || ret.Err() != nil {
 				log.Errorln("[DataStorage] redis storage error: ", block.storageModel, key, rowId)
 			}
 		}
+
+		/*		// Radix.v2
+				for _, key := range setKeys {
+					ret, err := redisPool.Cmd(block.storageModel, 1, rowId).Int()
+					if ret <= 0 || err != nil {
+						log.Errorln("[DataStorage] redis storage error: ", block.storageModel, key, rowId)
+					}
+				}*/
 	}
 }
 
@@ -350,19 +360,20 @@ func formatUrl(url, time string) urlNode {
 // 根据时间格式获取时间
 func getTime(timeType string) string {
 	// 时间格式
+	// 时间必须是2006-01-02 15:04:05
+	// go诞生之日, 记忆方法:6-1-2-3-4-5
 	var format string
 	switch timeType {
 	case "day":
-		format = "2020-01-01"
+		format = "2006-01-02"
 		break
 	case "hour":
-		format = "2020-01-01 01"
+		format = "2006-01-02 15"
 		break
 	case "min":
-		format = "2020-01-01 01:01"
+		format = "2006-01-02 15:04"
 		break
 	}
 	t, _ := time.Parse(format, time.Now().Format(format))
-
 	return strconv.FormatInt(t.Unix(), 10)
 }
