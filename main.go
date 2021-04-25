@@ -5,7 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"flag"
-	"github.com/go-redis/redis"
+	"github.com/mediocregopher/radix.v2/pool"
 	"github.com/mgutz/str"
 	"github.com/sirupsen/logrus"
 	"io"
@@ -17,11 +17,11 @@ import (
 )
 
 const (
-	START_STR = "127.0.0.1--"
-	END_STR = "/HTTP"
+	START_STR    = "127.0.0.1--"
+	END_STR      = "/HTTP"
 	HANDLE_MOVIE = "/movie/"
-    HANDLE_LIST = "/list/"
-    HANDLE_HTML = ".html"
+	HANDLE_LIST  = "/list/"
+	HANDLE_HTML  = ".html"
 )
 
 type cmdParams struct {
@@ -32,7 +32,7 @@ type cmdParams struct {
 
 // channel中进行信息传输的
 type urlData struct {
-	data digData  // 挖掘出的数据
+	data digData // 挖掘出的数据
 	uid  string
 	un   urlNode
 }
@@ -45,22 +45,23 @@ type digData struct {
 }
 
 type storageBlock struct {
-	counterType  string
+	counterType string
 	// 采用什么数据库存储 redis
 	storageModel string
-	un        urlNode
+	un           urlNode
 }
 
 // 存储用的
 type urlNode struct {
-	unType string   // 详情页/列表页/首页
-	unRid int       // Resource ID 资源id
-	unUrl string    // 当前页面url
-	unTime string   // 访问当前页面的时间
+	unType string // 详情页/列表页/首页
+	unRid  int    // Resource ID 资源id
+	unUrl  string // 当前页面url
+	unTime string // 访问当前页面的时间
 }
 
 // 日志
 var log = logrus.New()
+
 func init() {
 	log.Out = os.Stdout
 	log.SetLevel(logrus.DebugLevel)
@@ -73,7 +74,7 @@ func main() {
 	// 程序运行时的日志位置
 	l := flag.String("l", "F:\\go_project\\src\\analysis\\logs\\tmp.log", "tmp log")
 	flag.Parse()
-
+	// 命令行参数
 	params := cmdParams{
 		logPath:    *logPath,
 		routineNum: *routineNum,
@@ -94,13 +95,13 @@ func main() {
 	var uvChannel = make(chan urlData, params.routineNum)
 	var storeChannel = make(chan storageBlock, params.routineNum)
 
-	// redis连接池
+	/*// go-redis  redis连接池
 	redisPool := redis.NewClient(&redis.Options{
 		//连接信息
-		Network:  "tcp",                  //网络类型，tcp or unix，默认tcp
-		Addr:     "127.0.0.1:6379",       //主机名+冒号+端口，默认localhost:6379
-		Password: "123456",               //密码
-		DB:       0,                      // redis数据库index
+		Network:  "tcp",            //网络类型，tcp or unix，默认tcp
+		Addr:     "127.0.0.1:6379", //主机名+冒号+端口，默认localhost:6379
+		Password: "123456",         //密码
+		DB:       0,                // redis数据库index
 
 		//连接池容量及闲置连接数量
 		PoolSize:     2 * params.routineNum, // 连接池最大socket连接数，默认为4倍CPU数， 4 * runtime.NumCPU
@@ -132,29 +133,92 @@ func main() {
 
 		}()
 		defer redisPool.Close()
+	}*/
+
+	// Redis Pool
+	redisPool, err := pool.New("tcp", "localhost:6379", 2*params.routineNum)
+	if err != nil {
+		log.Fatalln("Redis pool created failed.")
+		panic(err)
+	} else {
+		go func() {
+			for {
+				redisPool.Cmd("PING")
+				time.Sleep(3 * time.Second)
+			}
+		}()
 	}
 
-
-	// 日志消费者
+	// （日志消费者）开启goroutine 消费日志
 	go readFileByLine(params, logChannel)
 
-	// 创建一组日志处理者
+	// （日志处理者）创建一组goroutine对日志进行处理
 	for i := 0; i < params.routineNum; i++ {
 		go logConsumer(logChannel, pvChannel, uvChannel)
 	}
 
-	// 创建 PV UV 统计器  (可拓展 xxxConunter)
+	// （数据统计）创建goroutine 统计PV和UV (可拓展 xxxConunter)
 	go pvCounter(pvChannel, storeChannel)
 	go uvCounter(uvChannel, storeChannel, redisPool)
 
-	// 创建 存储器
+	// (数据存储) 创建 goroutine 进行数据存储
 	go dataStorage(storeChannel, redisPool)
 
 	time.Sleep(1 * time.Hour)
 }
 
-func dataStorage(storeChannel chan storageBlock, redisPool *redis.Client) {
+// 统计分析模块：逐行消费日志
+func readFileByLine(params cmdParams, logChannel chan string) {
+	file, err := os.Open(params.logPath)
+	if err != nil {
+		log.Warningf("[readFileByLine] can't open file: %v", err)
+	}
+	defer file.Close()
 
+	count := 0
+	bufReader := bufio.NewReader(file)
+	for {
+		// 按行读
+		line, err := bufReader.ReadString('\n')
+		logChannel <- line
+		count++
+		if count%(2*params.routineNum) == 0 {
+			log.Infof("[readFileByLine] read： %d line", count)
+		}
+		if err != nil {
+			if err == io.EOF {
+				// 读到日志末尾
+				time.Sleep(3 * time.Second)
+				log.Infof("[readFileByLine] wait, read： %d line", count)
+			} else {
+				log.Warningf("[readFileByLine] read log error: %s", err)
+			}
+		}
+	}
+}
+
+// 日志解析模块：消费chanel中日志
+func logConsumer(logChannel chan string, pvChannel, uvChannel chan urlData) error {
+	// 从logChannel中消费日志
+	for logStr := range logChannel {
+		// 切割日志字符串，拿出需要的数据
+		needData := cutLogFetchData(logStr)
+
+		// uid ：模拟一个用户id
+		hasher := md5.New()
+		hasher.Write([]byte(needData.refer + needData.ua))
+		uid := hex.EncodeToString(hasher.Sum(nil))
+
+		// 使用解析到的数据构建 urlData
+		uData := urlData{needData, uid, formatUrl(needData.url, needData.time)}
+
+		log.Infoln(uData)
+
+		// 放入channel中用于统计
+		pvChannel <- uData
+		uvChannel <- uData
+	}
+	return nil
 }
 
 // 统计分析模块 PV(页面浏览量或点击量) UV(访问人数)
@@ -162,20 +226,31 @@ func dataStorage(storeChannel chan storageBlock, redisPool *redis.Client) {
 func pvCounter(pvChannel chan urlData, storeChannel chan storageBlock) {
 	// 消费数据
 	for data := range pvChannel {
-		storeData := storageBlock{"pv", "ZINCREBY", data.un}
+		storeData := storageBlock{"pv", "ZINCRBY", data.un}
 		storeChannel <- storeData
 	}
 }
+
 // UV Channel (需要去重)
-func uvCounter(uvChannel chan urlData, storeChannel chan storageBlock, redisPool *redis.Client) {
+func uvCounter(uvChannel chan urlData, storeChannel chan storageBlock, redisPool *pool.Pool) {
 	for udata := range uvChannel {
 		// 去重  HyperLogLog  redis
-		hyperLogLogkey := "uv_hpll_" + getTime(udata.data.time, "day")
+		hyperLogLogkey := "uv_hpll_" + getTime("day")
+
+		/*// go-redis
 		res := redisPool.PFAdd(hyperLogLogkey, udata.uid)
 		//  一天内用户不能重复
-		redisPool.Expire(hyperLogLogkey, 24 * time.Hour)
-		if res.Val() == 1{
+		redisPool.Expire(hyperLogLogkey, 24*time.Hour)
+		if res.Val() == 1 {
 			// 说明 hyperloglog中不存在
+			continue
+		}*/
+
+		ret, err := redisPool.Cmd("PFADD", hyperLogLogkey, udata.uid, "EX", 86400).Int()
+		if err != nil {
+			log.Warningln("[UvCounter] check redis hyperloglog failed, ", err)
+		}
+		if ret != 1 {
 			continue
 		}
 
@@ -188,38 +263,74 @@ func uvCounter(uvChannel chan urlData, storeChannel chan storageBlock, redisPool
 	}
 }
 
-// 日志解析模块：消费chanel中日志
-func logConsumer(logChannel chan string, pvChannel, uvChannel chan urlData) error{
-	// 从logChannel中消费日志
-	for logStr := range logChannel {
-		// 切割日志字符串，拿出需要的数据
-		need := cutLogFetchData(logStr)
+func dataStorage(storeChannel chan storageBlock, redisPool *pool.Pool) {
+	for block := range storeChannel {
+		// 表示counter类型（PV，UV）
+		prefix := block.counterType + "_"
 
-		// uid ：模拟一个用户id
-		hasher := md5.New()
-		hasher.Write([]byte(need.refer + need.ua))
-		uid := hex.EncodeToString(hasher.Sum(nil))
+		// 逐层添加
+		// 维度：天 小时 分钟
+		// 层级：网站-大分类-小分类-终极页面
+		// 存储模型： Redis SortedSet
+		setKeys := []string{
+			// 按照什么时间类型统计(day，hour，min)
+			prefix + "day" + getTime("day"),
+			prefix + "hour" + getTime("hour"),
+			prefix + "min" + getTime("min"),
+			// 按照什么页面统计(网站首页/列表页/详情页)
+			prefix + block.un.unType + "_day_" + getTime("day"),
+			prefix + block.un.unType + "_hour_" + getTime("hour"),
+			prefix + block.un.unType + "_min_" + getTime("min"),
+		}
 
-		// 使用解析到的数据构建 urlData
-		uData := urlData{need,uid, formatUrl(need.url, need.time)}
+		rowId := block.un.unRid
 
-		log.Infoln(uData)
-
-		// 放入channel中用于统计
-		pvChannel <- uData
-		uvChannel <- uData
+		for _, key := range setKeys {
+			ret, err := redisPool.Cmd(block.storageModel, 1, rowId).Int()
+			if ret <= 0 || err != nil {
+				log.Errorln("[DataStorage] redis storage error: ", block.storageModel, key, rowId)
+			}
+		}
 	}
-	return nil
 }
 
+// 切割日志字符串，拿出需要的数据
+func cutLogFetchData(logStr string) digData {
+	// 去除空格
+	logStr = strings.TrimSpace(logStr)
+	startIndex := str.IndexOf(logStr, START_STR, 0)
+	if startIndex == -1 {
+		return digData{}
+	}
+	startIndex += len(START_STR)
+	endIndex := str.IndexOf(logStr, END_STR, startIndex)
+
+	d := str.Substr(logStr, startIndex, endIndex-startIndex)
+
+	urlInfo, err := url.Parse("http://127.0.0.1/?" + d)
+	if err != nil {
+		return digData{}
+	}
+	data := urlInfo.Query()
+	// 返回需要的信息
+	needData := digData{
+		data.Get("time"),
+		data.Get("refer"),
+		data.Get("url"),
+		data.Get("ua"),
+	}
+	return needData
+}
+
+// 解析日志中需要的数据
 func formatUrl(url, time string) urlNode {
 	// 一定从量大的着手,  详情页>列表页≥首页
 	pos1 := str.IndexOf(url, HANDLE_MOVIE, 0)
-	// 从url中获取id
+	// 从url中获取页面id
 	if pos1 != -1 {
 		pos1 += len(HANDLE_MOVIE)
 		pos2 := str.IndexOf(url, HANDLE_HTML, 0)
-		idStr := str.Substr(url, pos1, pos2 - pos1)
+		idStr := str.Substr(url, pos1, pos2-pos1)
 		id, _ := strconv.Atoi(idStr)
 		return urlNode{"movie", id, url, time}
 	} else {
@@ -236,64 +347,8 @@ func formatUrl(url, time string) urlNode {
 	}
 }
 
-// 切割日志字符串，拿出需要的数据
-func cutLogFetchData(logStr string) digData {
-	// 去除空格
-	logStr = strings.TrimSpace(logStr)
-	startIndex := str.IndexOf(logStr, START_STR, 0)
-	if startIndex == -1{
-		return digData{}
-	}
-	startIndex += len(START_STR)
-	endIndex := str.IndexOf(logStr, END_STR, startIndex)
-
-	d := str.Substr(logStr, startIndex, endIndex - startIndex)
-
-	urlInfo, err := url.Parse("http://127.0.0.1/?" + d)
-	if err != nil {
-		return digData{}
-	}
-	data := urlInfo.Query()
-	// 返回需要的信息
-	needData := digData{
-		data.Get("time"),
-		data.Get("refer"),
-		data.Get("url"),
-		data.Get("ua"),
-	}
-
-	return needData
-}
-
-// 统计分析模块：逐行消费日志
-func readFileByLine(params cmdParams, logChannel chan string) {
-	file, err := os.Open(params.logPath)
-	if err != nil {
-		log.Warningf("[readFileByLine] can't open file: %v", err)
-	}
-	defer file.Close()
-
-	count := 0
-	bufReader := bufio.NewReader(file)
-	for  {
-		line, err := bufReader.ReadString('\n')
-		logChannel <- line
-		count++
-		if count % (2 * params.routineNum) == 0{
-			log.Infof("[readFileByLine] read %d line", count)
-		}
-		if err != nil {
-			if err == io.EOF{
-				time.Sleep(3 * time.Second)
-				log.Infof("[readFileByLine] wait, read %d line", count)
-			}else {
-				log.Warningf("[readFileByLine] read log error: %s", err)
-			}
-		}
-	}
-}
-
-func getTime(logTime, timeType string) string{
+// 根据时间格式获取时间
+func getTime(timeType string) string {
 	// 时间格式
 	var format string
 	switch timeType {
